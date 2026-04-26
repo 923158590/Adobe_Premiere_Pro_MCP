@@ -1,13 +1,31 @@
 /**
  * MCP Premiere Pro Bridge (CEP)
  * Uses CSInterface.evalScript to run ExtendScript in Premiere Pro.
- * Works in release Premiere Pro — no Beta or UXP Developer Tool required.
+ * Supports both file-based polling and WebSocket server for remote connections.
+ *
+ * Transport is selected in the panel UI:
+ *   - File mode:   original polling of /tmp/premiere-mcp-bridge
+ *   - WebSocket:   starts a WS server for direct remote MCP connections
  */
 
 (function() {
     var fs = require('fs');
     var path = require('path');
     var os = require('os');
+
+    // ─── WebSocket Server (loaded dynamically) ──────────────────────
+    var WebSocketServer = null;
+    try {
+        var wsPath = path.join(__dirname, 'node_modules', 'ws');
+        WebSocketServer = require(wsPath).Server;
+    } catch (e) {
+        try {
+            WebSocketServer = require('ws').Server;
+        } catch (e2) {
+            // WebSocket not available — file-only mode
+        }
+    }
+
     var EXTENDSCRIPT_COMPAT_HELPERS = [
         'function __mcpEscapeString(value) {',
         '    return String(value)',
@@ -56,6 +74,12 @@
         this.commandQueue = [];
         this.isProcessing = false;
         this.csInterface = new CSInterface();
+
+        // WebSocket state
+        this.wss = null;
+        this.wsClients = [];
+        this.wsPort = 9876;
+
         this.init();
     }
 
@@ -70,7 +94,6 @@
     MCPPremiereBridge.prototype.init = function() {
         this.log('Initializing MCP Bridge (CEP)...', 'info');
 
-        // Check host environment
         try {
             var env = this.normalizeHostEnvironment(this.csInterface.getHostEnvironment());
             if (env) {
@@ -82,7 +105,12 @@
 
         this.loadConfig();
         this.updateUI();
-        this.startCommandPolling();
+
+        if (WebSocketServer) {
+            this.log('WebSocket module available — can enable remote connections', 'info');
+        } else {
+            this.log('WebSocket module not found — file-only mode', 'warning');
+        }
     };
 
     MCPPremiereBridge.prototype.getTempDirectory = function() {
@@ -117,6 +145,8 @@
             return null;
         }
     };
+
+    // ─── File-based Command Processing ──────────────────────────────
 
     MCPPremiereBridge.prototype.watchDirectory = function(dirPath) {
         try {
@@ -165,6 +195,8 @@
         }
     };
 
+    // ─── Command Execution (shared by file and WebSocket) ───────────
+
     MCPPremiereBridge.prototype.executeCommand = function(command, done) {
         var self = this;
         this.updateCommandStatus(command.id, 'executing');
@@ -189,7 +221,6 @@
                 return;
             }
 
-            // Get host environment info for debugging
             var hostEnv = this.normalizeHostEnvironment(this.csInterface.getHostEnvironment());
             if (!hostEnv) {
                 callback(new Error('Could not get host environment. Is Premiere Pro running?'));
@@ -242,6 +273,8 @@
         return script.length <= 500000;
     };
 
+    // ─── File Polling ───────────────────────────────────────────────
+
     MCPPremiereBridge.prototype.startCommandPolling = function() {
         var self = this;
         setInterval(function() {
@@ -252,96 +285,154 @@
         }, 250);
     };
 
-    MCPPremiereBridge.prototype.addToQueue = function(command) {
-        this.commandQueue.push({ id: command.id, status: 'pending', script: (command.script || '').substring(0, 50) + '...' });
-        this.updateCommandQueueUI();
-    };
+    // ─── WebSocket Server ───────────────────────────────────────────
 
-    MCPPremiereBridge.prototype.updateCommandStatus = function(commandId, status) {
-        for (var i = 0; i < this.commandQueue.length; i++) {
-            if (this.commandQueue[i].id === commandId) {
-                this.commandQueue[i].status = status;
-                break;
-            }
-        }
-        this.updateCommandQueueUI();
-    };
+    MCPPremiereBridge.prototype.startWebSocketServer = function() {
+        var self = this;
 
-    MCPPremiereBridge.prototype.updateCommandQueueUI = function() {
-        var el = document.getElementById('commandQueue');
-        if (!el) return;
-        if (this.commandQueue.length === 0) {
-            el.innerHTML = '<div class="command-item"><span class="command-label">No commands in queue</span></div>';
+        if (!WebSocketServer) {
+            this.log('WebSocket module not available. Cannot start WS server.', 'error');
             return;
         }
-        var html = this.commandQueue.slice(-5).map(function(cmd) {
-            return '<div class="command-item"><span class="command-label">' + cmd.script + '</span><span class="command-status ' + cmd.status + '">' + cmd.status + '</span></div>';
-        }).join('');
-        el.innerHTML = html;
-    };
 
-    MCPPremiereBridge.prototype.loadConfig = function() {
-        try {
-            var defaultPath = getDefaultTempPath();
-            if (fs.existsSync(defaultPath)) {
-                var configPath = path.join(defaultPath, 'config.json');
-                if (fs.existsSync(configPath)) {
-                    var config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
-                    if (config.tempDirectory) this.tempDirectory = config.tempDirectory;
-                }
-            }
-            var tempEl = document.getElementById('tempDirectory');
-            if (tempEl && this.tempDirectory) tempEl.value = this.tempDirectory;
-        } catch (e) {}
-    };
+        if (this.wss) {
+            this.log('WebSocket server already running on port ' + this.wsPort, 'info');
+            return;
+        }
 
-    MCPPremiereBridge.prototype.saveConfig = function() {
+        var portEl = document.getElementById('wsPort');
+        this.wsPort = portEl ? parseInt(portEl.value, 10) || 9876 : 9876;
+
         try {
-            var tempEl = document.getElementById('tempDirectory');
-            var tempDir = tempEl ? tempEl.value.trim() : '';
-            if (tempDir) this.tempDirectory = tempDir;
-            var configPath = path.join(this.getTempDirectory(), 'config.json');
-            fs.writeFileSync(configPath, JSON.stringify({ tempDirectory: this.tempDirectory }, null, 2));
-            this.log('Configuration saved', 'info');
+            this.wss = new WebSocketServer({ port: this.wsPort });
         } catch (e) {
-            this.log('Error saving config: ' + e.message, 'error');
+            this.log('Failed to start WebSocket server: ' + e.message, 'error');
+            return;
+        }
+
+        this.wss.on('listening', function() {
+            self.log('WebSocket server listening on port ' + self.wsPort, 'info');
+            self.log('Remote MCP clients can connect to ws://<this-machine-ip>:' + self.wsPort, 'info');
+            self.updateWebSocketStatus(true);
+        });
+
+        this.wss.on('connection', function(ws) {
+            var clientAddr = ws._socket ? ws._socket.remoteAddress : 'unknown';
+            self.log('WebSocket client connected: ' + clientAddr, 'info');
+            self.wsClients.push(ws);
+            self.updateWebSocketClientCount();
+
+            ws.on('message', function(data) {
+                try {
+                    var command = JSON.parse(data.toString());
+                    self.log('WS command: ' + command.id, 'info');
+                    self.addToQueue(command);
+
+                    self.executeCommand(command, function(result) {
+                        try {
+                            ws.send(JSON.stringify({
+                                id: command.id,
+                                result: result,
+                                timestamp: new Date().toISOString()
+                            }));
+                            self.updateCommandStatus(command.id, 'completed');
+                        } catch (sendErr) {
+                            self.log('WS send error: ' + sendErr.message, 'error');
+                        }
+                    });
+                } catch (parseErr) {
+                    self.log('WS message parse error: ' + parseErr.message, 'error');
+                    try {
+                        ws.send(JSON.stringify({ id: 'unknown', error: parseErr.message }));
+                    } catch (e) {}
+                }
+            });
+
+            ws.on('close', function() {
+                self.log('WebSocket client disconnected: ' + clientAddr, 'info');
+                self.wsClients = self.wsClients.filter(function(c) { return c !== ws; });
+                self.updateWebSocketClientCount();
+            });
+
+            ws.on('error', function(err) {
+                self.log('WebSocket client error: ' + err.message, 'error');
+            });
+        });
+
+        this.wss.on('error', function(err) {
+            self.log('WebSocket server error: ' + err.message, 'error');
+            self.wss = null;
+            self.updateWebSocketStatus(false);
+        });
+    };
+
+    MCPPremiereBridge.prototype.stopWebSocketServer = function() {
+        if (this.wss) {
+            this.wsClients.forEach(function(ws) {
+                try { ws.close(); } catch (e) {}
+            });
+            this.wsClients = [];
+            this.wss.close();
+            this.wss = null;
+            this.log('WebSocket server stopped', 'info');
+            this.updateWebSocketStatus(false);
+            this.updateWebSocketClientCount();
         }
     };
+
+    // ─── Bridge Start / Stop ────────────────────────────────────────
 
     MCPPremiereBridge.prototype.startBridge = function() {
         this.log('Starting MCP Bridge...', 'info');
         this.isConnected = true;
         this.updateUI();
         var tempPath = this.getTempDirectory();
-        this.log('Watching: ' + tempPath + ' (must match your MCP client PREMIERE_TEMP_DIR)', 'info');
+        this.log('Watching: ' + tempPath + ' (must match PREMIERE_TEMP_DIR)', 'info');
         this.updateServerStatus(true);
-        this.log('Bridge ready. Connect from Codex, Claude, or another MCP client using this same temp directory.', 'info');
+
+        // Start file polling
+        this.startCommandPolling();
+
+        // Auto-start WebSocket if enabled
+        var wsEnabled = document.getElementById('wsEnabled');
+        if (wsEnabled && wsEnabled.checked) {
+            this.startWebSocketServer();
+        }
+
+        this.log('Bridge ready. Connect via file bridge or WebSocket.', 'info');
     };
 
     MCPPremiereBridge.prototype.stopBridge = function() {
         this.log('Stopping MCP Bridge...', 'info');
         this.isConnected = false;
+        this.stopWebSocketServer();
         this.updateUI();
         this.updateServerStatus(false);
     };
 
+    // ─── Diagnostics ────────────────────────────────────────────────
+
     MCPPremiereBridge.prototype.runDiagnostics = function() {
         var self = this;
-        var hostEnvironment = null;
         var report = {
             generatedAt: new Date().toISOString(),
             panel: 'MCP Bridge (CEP)',
             tempDirectory: this.getTempDirectory(),
+            transport: {
+                file: true,
+                websocket: {
+                    available: !!WebSocketServer,
+                    running: !!this.wss,
+                    port: this.wsPort,
+                    clients: this.wsClients.length
+                }
+            },
             hostEnvironment: null,
             checks: []
         };
 
         function addCheck(name, success, details) {
-            report.checks.push({
-                name: name,
-                success: success,
-                details: details
-            });
+            report.checks.push({ name: name, success: success, details: details });
         }
 
         function finalize() {
@@ -355,7 +446,7 @@
         this.log('Running CEP diagnostics...', 'info');
 
         try {
-            hostEnvironment = this.normalizeHostEnvironment(this.csInterface.getHostEnvironment());
+            var hostEnvironment = this.normalizeHostEnvironment(this.csInterface.getHostEnvironment());
             report.hostEnvironment = hostEnvironment;
             addCheck('host_environment', !!hostEnvironment, hostEnvironment || 'No host environment returned');
         } catch (e) {
@@ -444,6 +535,36 @@
         });
     };
 
+    // ─── UI Updates ─────────────────────────────────────────────────
+
+    MCPPremiereBridge.prototype.addToQueue = function(command) {
+        this.commandQueue.push({ id: command.id, status: 'pending', script: (command.script || '').substring(0, 50) + '...' });
+        this.updateCommandQueueUI();
+    };
+
+    MCPPremiereBridge.prototype.updateCommandStatus = function(commandId, status) {
+        for (var i = 0; i < this.commandQueue.length; i++) {
+            if (this.commandQueue[i].id === commandId) {
+                this.commandQueue[i].status = status;
+                break;
+            }
+        }
+        this.updateCommandQueueUI();
+    };
+
+    MCPPremiereBridge.prototype.updateCommandQueueUI = function() {
+        var el = document.getElementById('commandQueue');
+        if (!el) return;
+        if (this.commandQueue.length === 0) {
+            el.innerHTML = '<div class="command-item"><span class="command-label">No commands in queue</span></div>';
+            return;
+        }
+        var html = this.commandQueue.slice(-5).map(function(cmd) {
+            return '<div class="command-item"><span class="command-label">' + cmd.script + '</span><span class="command-status ' + cmd.status + '">' + cmd.status + '</span></div>';
+        }).join('');
+        el.innerHTML = html;
+    };
+
     MCPPremiereBridge.prototype.updateUI = function() {
         var connectionStatus = document.getElementById('connectionStatus');
         var connectionText = document.getElementById('connectionText');
@@ -475,6 +596,73 @@
                 serverStatus.className = 'status-dot disconnected';
                 serverText.textContent = 'Premiere Pro: Start Bridge to enable';
             }
+        }
+    };
+
+    MCPPremiereBridge.prototype.updateWebSocketStatus = function(isRunning) {
+        var wsStatus = document.getElementById('wsStatus');
+        var wsText = document.getElementById('wsText');
+        if (wsStatus && wsText) {
+            if (isRunning) {
+                wsStatus.className = 'status-dot connected';
+                wsText.textContent = 'WS: Port ' + this.wsPort;
+            } else {
+                wsStatus.className = 'status-dot disconnected';
+                wsText.textContent = 'WS: Off';
+            }
+        }
+    };
+
+    MCPPremiereBridge.prototype.updateWebSocketClientCount = function() {
+        var el = document.getElementById('wsClientCount');
+        if (el) {
+            el.textContent = this.wsClients.length + ' client(s)';
+        }
+    };
+
+    MCPPremiereBridge.prototype.loadConfig = function() {
+        try {
+            var defaultPath = getDefaultTempPath();
+            if (fs.existsSync(defaultPath)) {
+                var configPath = path.join(defaultPath, 'config.json');
+                if (fs.existsSync(configPath)) {
+                    var config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+                    if (config.tempDirectory) this.tempDirectory = config.tempDirectory;
+                    if (config.wsPort) this.wsPort = config.wsPort;
+                    if (config.wsEnabled !== undefined) {
+                        var wsEnabledEl = document.getElementById('wsEnabled');
+                        if (wsEnabledEl) wsEnabledEl.checked = config.wsEnabled;
+                    }
+                }
+            }
+            var tempEl = document.getElementById('tempDirectory');
+            if (tempEl && this.tempDirectory) tempEl.value = this.tempDirectory;
+            var portEl = document.getElementById('wsPort');
+            if (portEl) portEl.value = this.wsPort;
+        } catch (e) {}
+    };
+
+    MCPPremiereBridge.prototype.saveConfig = function() {
+        try {
+            var tempEl = document.getElementById('tempDirectory');
+            var tempDir = tempEl ? tempEl.value.trim() : '';
+            if (tempDir) this.tempDirectory = tempDir;
+
+            var portEl = document.getElementById('wsPort');
+            if (portEl) this.wsPort = parseInt(portEl.value, 10) || 9876;
+
+            var wsEnabledEl = document.getElementById('wsEnabled');
+            var wsEnabled = wsEnabledEl ? wsEnabledEl.checked : false;
+
+            var configPath = path.join(this.getTempDirectory(), 'config.json');
+            fs.writeFileSync(configPath, JSON.stringify({
+                tempDirectory: this.tempDirectory,
+                wsPort: this.wsPort,
+                wsEnabled: wsEnabled
+            }, null, 2));
+            this.log('Configuration saved', 'info');
+        } catch (e) {
+            this.log('Error saving config: ' + e.message, 'error');
         }
     };
 

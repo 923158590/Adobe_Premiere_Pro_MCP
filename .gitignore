@@ -1,5 +1,9 @@
 # Dependencies
 node_modules/
+# CEP plugin needs ws bundled for its Node.js runtime
+!cep-plugin/node_modules/
+!cep-plugin/node_modules/ws/
+!cep-plugin/node_modules/ws/**
 
 # Build
 dist/

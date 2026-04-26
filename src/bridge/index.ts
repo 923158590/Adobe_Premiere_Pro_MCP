@@ -1,8 +1,12 @@
 /**
  * Bridge module for communicating with Adobe Premiere Pro
- * 
+ *
  * This module handles the communication between the MCP server and Adobe Premiere Pro
- * using various methods including UXP, ExtendScript, and file-based communication.
+ * using WebSocket or file-based communication.
+ *
+ * Transport is selected via environment variables:
+ *   PREMIERE_BRIDGE_URL=ws://host:port  → WebSocket mode (remote-capable)
+ *   (no PREMIERE_BRIDGE_URL)             → File mode (original local behaviour)
  */
 
 import { Logger } from '../utils/logger.js';
@@ -10,6 +14,7 @@ import { ChildProcess } from 'child_process';
 import { promises as fs } from 'fs';
 import { join } from 'path';
 import { v4 as uuidv4 } from 'uuid';
+import WebSocket from 'ws';
 import { createSecureTempDir, validateFilePath } from '../utils/security.js';
 import type { PremiereProTransport } from './types.js';
 
@@ -146,74 +151,161 @@ export interface PremiereProEffect {
 
 export class PremiereProBridge implements PremiereProTransport {
   private logger: Logger;
-  private communicationMethod: 'uxp' | 'extendscript' | 'file';
+  private transportMode: 'file' | 'websocket';
   private tempDir: string;
   private readonly usesExternalTempDir: boolean;
   private uxpProcess?: ChildProcess;
   private isInitialized = false;
   private sessionId: string;
 
+  // WebSocket transport state
+  private ws: WebSocket | null = null;
+  private readonly bridgeUrl: string | null = null;
+  private wsReconnectTimer: ReturnType<typeof setTimeout> | null = null;
+
   constructor() {
     this.logger = new Logger('PremiereProBridge');
-    this.communicationMethod = 'file'; // Default to file-based communication
     this.sessionId = uuidv4();
-    // Use PREMIERE_TEMP_DIR if set (same path as UXP plugin "Temp Directory"), else session-specific
-    const envDir = process.env.PREMIERE_TEMP_DIR;
-    this.usesExternalTempDir = Boolean(envDir);
-    this.tempDir = envDir ? envDir.replace(/\/$/, '') : createSecureTempDir(this.sessionId);
+
+    const bridgeUrl = process.env.PREMIERE_BRIDGE_URL;
+    if (bridgeUrl) {
+      this.transportMode = 'websocket';
+      this.bridgeUrl = bridgeUrl;
+      const envDir = process.env.PREMIERE_TEMP_DIR;
+      this.usesExternalTempDir = Boolean(envDir);
+      this.tempDir = envDir ? envDir.replace(/\/$/, '') : '/tmp/premiere-mcp-bridge';
+    } else {
+      this.transportMode = 'file';
+      this.bridgeUrl = null;
+      const envDir = process.env.PREMIERE_TEMP_DIR;
+      this.usesExternalTempDir = Boolean(envDir);
+      this.tempDir = envDir ? envDir.replace(/\/$/, '') : createSecureTempDir(this.sessionId);
+    }
   }
 
   async initialize(): Promise<void> {
     try {
-      await this.setupTempDirectory();
-      await this.detectPremiereProInstallation();
-      await this.initializeCommunication();
+      if (this.transportMode === 'websocket') {
+        await this.connectWebSocket();
+      } else {
+        await this.setupTempDirectory();
+      }
       this.isInitialized = true;
-      this.logger.info('Adobe Premiere Pro bridge initialized successfully');
+      this.logger.info(`Premiere Pro bridge initialized (${this.transportMode} mode)`);
     } catch (error) {
-      this.logger.error('Failed to initialize Adobe Premiere Pro bridge:', error);
+      this.logger.error('Failed to initialize bridge:', error);
       throw error;
     }
   }
 
+  // ─── WebSocket Transport ──────────────────────────────────────────
+
+  private connectWebSocket(): Promise<void> {
+    return new Promise((resolve, reject) => {
+      if (!this.bridgeUrl) {
+        reject(new Error('PREMIERE_BRIDGE_URL is not set'));
+        return;
+      }
+      this.logger.info(`Connecting to CEP bridge at ${this.bridgeUrl}...`);
+      this.ws = new WebSocket(this.bridgeUrl);
+
+      const timeout = setTimeout(() => {
+        reject(new Error(`WebSocket connection timeout to ${this.bridgeUrl}`));
+      }, 10000);
+
+      this.ws.on('open', () => {
+        clearTimeout(timeout);
+        this.logger.info('WebSocket connected to CEP bridge');
+        resolve();
+      });
+
+      this.ws.on('error', (err) => {
+        clearTimeout(timeout);
+        this.logger.error(`WebSocket error: ${err.message}`);
+        if (!this.isInitialized) reject(err);
+      });
+
+      this.ws.on('close', () => {
+        this.logger.warn('WebSocket disconnected');
+        this.scheduleReconnect();
+      });
+    });
+  }
+
+  private scheduleReconnect(): void {
+    if (this.wsReconnectTimer) return;
+    this.wsReconnectTimer = setTimeout(() => {
+      this.wsReconnectTimer = null;
+      if (!this.bridgeUrl) return;
+      this.logger.info('Attempting WebSocket reconnect...');
+      this.ws = new WebSocket(this.bridgeUrl);
+
+      this.ws.on('open', () => {
+        this.logger.info('WebSocket reconnected');
+      });
+      this.ws.on('error', (err) => {
+        this.logger.error(`WebSocket reconnect error: ${err.message}`);
+      });
+      this.ws.on('close', () => {
+        this.scheduleReconnect();
+      });
+    }, 3000);
+  }
+
+  private executeScriptViaWebSocket(script: string): Promise<any> {
+    return new Promise((resolve, reject) => {
+      if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+        reject(new Error('WebSocket not connected. Ensure CEP bridge panel is open and started.'));
+        return;
+      }
+
+      const commandId = uuidv4();
+      const fullScript = this.buildExecutableScript(script);
+
+      const timer = setTimeout(() => {
+        this.ws!.off('message', handler);
+        reject(new Error('WebSocket response timeout (60s)'));
+      }, 60000);
+
+      const handler = (data: WebSocket.Data) => {
+        try {
+          const msg = JSON.parse(data.toString());
+          if (msg.id === commandId) {
+            clearTimeout(timer);
+            this.ws!.off('message', handler);
+            if (msg.error) {
+              reject(new Error(msg.error));
+            } else {
+              resolve(msg.result !== undefined ? msg.result : msg);
+            }
+          }
+        } catch {
+          // ignore non-matching or malformed messages
+        }
+      };
+
+      this.ws!.on('message', handler);
+      this.ws!.send(JSON.stringify({
+        id: commandId,
+        script: fullScript,
+        timestamp: new Date().toISOString()
+      }));
+    });
+  }
+
+  // ─── File Transport (original) ────────────────────────────────────
+
   private async setupTempDirectory(): Promise<void> {
     try {
-      await fs.mkdir(this.tempDir, { recursive: true, mode: 0o700 }); // Restrict to owner only
-      this.logger.debug(`Secure temp directory created: ${this.tempDir}`);
+      await fs.mkdir(this.tempDir, { recursive: true, mode: 0o700 });
+      this.logger.debug(`Temp directory ready: ${this.tempDir}`);
     } catch (error) {
       this.logger.error('Failed to create temp directory:', error);
       throw error;
     }
   }
 
-  private async detectPremiereProInstallation(): Promise<void> {
-    // Check for common Premiere Pro installation paths
-    const commonPaths = [
-      '/Applications/Adobe Premiere Pro 2024/Adobe Premiere Pro 2024.app',
-      '/Applications/Adobe Premiere Pro 2023/Adobe Premiere Pro 2023.app',
-      'C:\\Program Files\\Adobe\\Adobe Premiere Pro 2024\\Adobe Premiere Pro.exe',
-      'C:\\Program Files\\Adobe\\Adobe Premiere Pro 2023\\Adobe Premiere Pro.exe'
-    ];
-
-    for (const path of commonPaths) {
-      try {
-        await fs.access(path);
-        this.logger.info(`Found Adobe Premiere Pro at: ${path}`);
-        return;
-      } catch (error) {
-        // Continue checking other paths
-      }
-    }
-
-    this.logger.warn('Adobe Premiere Pro installation not found in common paths');
-  }
-
-  private async initializeCommunication(): Promise<void> {
-    // For now, we'll use file-based communication as it's the most reliable
-    // In a production environment, you would set up UXP or ExtendScript communication
-    this.communicationMethod = 'file';
-    this.logger.info(`Using ${this.communicationMethod} communication method`);
-  }
+  // ─── Script Helpers ───────────────────────────────────────────────
 
   private isSelfInvokingScript(script: string): boolean {
     const trimmed = script.trim();
@@ -224,16 +316,21 @@ export class PremiereProBridge implements PremiereProTransport {
     if (this.isSelfInvokingScript(script)) {
       return EXTENDSCRIPT_HELPERS + script.trim();
     }
-
-    // Wrap script bodies so top-level "return ..." remains valid in ExtendScript.
     return EXTENDSCRIPT_HELPERS + '(function(){\n' + script + '\n})();';
   }
+
+  // ─── Unified executeScript ────────────────────────────────────────
 
   async executeScript(script: string): Promise<any> {
     if (!this.isInitialized) {
       throw new Error('Bridge not initialized. Call initialize() first.');
     }
 
+    if (this.transportMode === 'websocket') {
+      return this.executeScriptViaWebSocket(script);
+    }
+
+    // File-based transport
     const commandId = uuidv4();
     const commandFile = join(this.tempDir, `command-${commandId}.json`);
     const responseFile = join(this.tempDir, `response-${commandId}.json`);
@@ -241,23 +338,20 @@ export class PremiereProBridge implements PremiereProTransport {
     try {
       const fullScript = this.buildExecutableScript(script);
 
-      // Write command to file
       await fs.writeFile(commandFile, JSON.stringify({
         id: commandId,
         script: fullScript,
         timestamp: new Date().toISOString()
       }));
 
-      // Wait for response (in a real implementation, this would be handled by the UXP plugin)
       const response = await this.waitForResponse(responseFile);
-      
-      // Clean up files
+
       await fs.unlink(commandFile).catch(() => {});
       await fs.unlink(responseFile).catch(() => {});
 
       return response;
     } catch (error) {
-      this.logger.error(`Failed to execute script: ${error}`);
+      this.logger.error(`Script execution failed: ${error}`);
       throw error;
     }
   }
@@ -271,7 +365,7 @@ export class PremiereProBridge implements PremiereProTransport {
         const parsed = JSON.parse(response);
         if (parsed.result !== undefined) return parsed.result;
         return parsed;
-      } catch (error) {
+      } catch {
         await new Promise(resolve => setTimeout(resolve, 150));
       }
     }
@@ -282,14 +376,12 @@ export class PremiereProBridge implements PremiereProTransport {
     );
   }
 
-  // Project Management
+  // ─── Project Management ───────────────────────────────────────────
+
   async createProject(name: string, location: string): Promise<PremiereProProject> {
     const script = `
-      // Create new project
       app.newProject("${name}", "${location}");
       var project = app.project;
-      
-      // Return project info
       return JSON.stringify({
         id: project.documentID,
         name: project.name,
@@ -299,17 +391,13 @@ export class PremiereProBridge implements PremiereProTransport {
         projectItems: []
       });
     `;
-    
     return await this.executeScript(script);
   }
 
   async openProject(path: string): Promise<PremiereProProject> {
     const script = `
-      // Open existing project
       app.openDocument("${path}");
       var project = app.project;
-      
-      // Return project info
       return JSON.stringify({
         id: project.documentID,
         name: project.name,
@@ -319,28 +407,23 @@ export class PremiereProBridge implements PremiereProTransport {
         projectItems: []
       });
     `;
-    
     return await this.executeScript(script);
   }
 
   async saveProject(): Promise<void> {
     const script = `
-      // Save current project
       app.project.save();
       return JSON.stringify({ success: true });
     `;
-    
     await this.executeScript(script);
   }
 
   async importMedia(filePath: string): Promise<PremiereProProjectItem> {
-    // Validate file path for security
     const pathValidation = validateFilePath(filePath);
     if (!pathValidation.valid) {
       throw new Error(`Invalid file path: ${pathValidation.error}`);
     }
 
-    // Use the normalized path from validation (don't double-escape)
     const safePath = pathValidation.normalized || filePath;
     const script = `
       try {
@@ -427,10 +510,7 @@ export class PremiereProBridge implements PremiereProTransport {
 
   async createSequence(name: string, presetPath?: string): Promise<PremiereProSequence> {
     const script = `
-      // Create new sequence
       var sequence = app.project.createNewSequence("${name}", "${presetPath || ''}");
-      
-      // Return sequence info
       return JSON.stringify({
         id: sequence.sequenceID,
         name: sequence.name,
@@ -440,7 +520,6 @@ export class PremiereProBridge implements PremiereProTransport {
         audioTracks: []
       });
     `;
-    
     return await this.executeScript(script);
   }
 
@@ -497,22 +576,17 @@ export class PremiereProBridge implements PremiereProTransport {
         });
       }
     `;
-    
     return await this.executeScript(script);
   }
 
   async renderSequence(sequenceId: string, outputPath: string, presetPath: string): Promise<void> {
     const script = `
-      // Render sequence
       var sequence = app.project.getSequenceByID("${sequenceId}");
       var encoder = app.encoder;
-      
       encoder.encodeSequence(sequence, "${outputPath}", "${presetPath}",
         encoder.ENCODE_ENTIRE, false);
-
       return JSON.stringify({ success: true });
     `;
-    
     await this.executeScript(script);
   }
 
@@ -552,12 +626,22 @@ export class PremiereProBridge implements PremiereProTransport {
   }
 
   async cleanup(): Promise<void> {
+    // Close WebSocket
+    if (this.wsReconnectTimer) {
+      clearTimeout(this.wsReconnectTimer);
+      this.wsReconnectTimer = null;
+    }
+    if (this.ws) {
+      this.ws.removeAllListeners();
+      this.ws.close();
+      this.ws = null;
+    }
+
     if (this.uxpProcess) {
       this.uxpProcess.kill();
     }
-    
-    // Only remove temp dirs created by this server. The shared bridge directory is
-    // configured externally and should persist across restarts.
+
+    // Only remove temp dirs created by this server
     try {
       if (!this.usesExternalTempDir) {
         await fs.rm(this.tempDir, { recursive: true });
@@ -565,7 +649,7 @@ export class PremiereProBridge implements PremiereProTransport {
     } catch (error) {
       this.logger.warn('Failed to clean up temp directory:', error);
     }
-    
-    this.logger.info('Adobe Premiere Pro bridge cleaned up');
+
+    this.logger.info('Premiere Pro bridge cleaned up');
   }
-} 
+}

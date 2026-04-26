@@ -449,6 +449,12 @@
                     <span class="meta-value">Live Queue</span>
                 </div>
             </div>
+            <div class="hero-meta" style="margin-top: 8px;">
+                <div class="meta-card" style="grid-column: span 3;">
+                    <span class="meta-label">WebSocket</span>
+                    <span class="meta-value" id="wsClientCount">0 client(s)</span>
+                </div>
+            </div>
         </section>
 
         <section class="panel">
@@ -471,19 +477,45 @@
                         <span class="status-text" id="serverText">Start Bridge to enable</span>
                     </div>
                 </div>
+                <div class="status-card">
+                    <div class="status-caption">WebSocket</div>
+                    <div class="status-indicator">
+                        <div class="status-dot disconnected" id="wsStatus"></div>
+                        <span class="status-text" id="wsText">WS: Off</span>
+                    </div>
+                </div>
+                <div class="status-card">
+                    <div class="status-caption">WS Clients</div>
+                    <div class="status-indicator">
+                        <span class="status-text" id="wsClientCount">0 client(s)</span>
+                    </div>
+                </div>
             </div>
         </section>
 
         <section class="panel">
             <div class="panel-title">
                 <h2>Configuration</h2>
-                <span>Shared temp directory</span>
+                <span>Shared temp directory + WebSocket</span>
             </div>
             <div class="config-copy">
                 This must match the `PREMIERE_TEMP_DIR` value used by your MCP client.
             </div>
             <label for="tempDirectory">Temp Directory</label>
             <input type="text" id="tempDirectory" placeholder="Temp Directory (e.g. /tmp/premiere-mcp-bridge)" value="/tmp/premiere-mcp-bridge">
+
+            <div style="margin-top: 14px; padding-top: 12px; border-top: 1px solid rgba(129, 170, 197, 0.1);">
+                <div class="config-copy">
+                    Enable WebSocket to allow remote MCP clients to connect over the network.
+                </div>
+                <label style="display: flex; align-items: center; gap: 8px; text-transform: none; font-size: 12px; letter-spacing: 0;">
+                    <input type="checkbox" id="wsEnabled" style="width: auto; accent-color: var(--accent);">
+                    Enable WebSocket Server
+                </label>
+                <label for="wsPort" style="margin-top: 10px;">WebSocket Port</label>
+                <input type="text" id="wsPort" placeholder="9876" value="9876">
+            </div>
+
             <div class="button-row">
                 <button class="primary" onclick="saveConfig()">Save Configuration</button>
             </div>
