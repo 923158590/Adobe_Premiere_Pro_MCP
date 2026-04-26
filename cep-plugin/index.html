@@ -532,6 +532,20 @@
                 <button class="secondary" onclick="runDiagnostics()" id="diagnosticsButton">Run Diagnostics</button>
                 <button class="utility" onclick="clearLog()" id="clearButton">Clear Log</button>
             </div>
+            <div style="margin-top: 14px; padding-top: 12px; border-top: 1px solid rgba(129, 170, 197, 0.1);">
+                <div class="config-copy">Log controls — reduce verbosity or disable logging entirely.</div>
+                <div style="display: flex; gap: 10px; align-items: center; flex-wrap: wrap;">
+                    <label style="display: flex; align-items: center; gap: 6px; text-transform: none; font-size: 12px; letter-spacing: 0; cursor: pointer;">
+                        <input type="checkbox" id="logEnabled" checked style="width: auto; accent-color: var(--accent);" onchange="window.setLogEnabled(this.checked)">
+                        Enable Log
+                    </label>
+                    <select id="logLevelSelect" onchange="window.setLogLevel(this.value)" style="background: var(--input); color: var(--text-0); border: 1px solid rgba(129, 170, 197, 0.14); border-radius: 8px; padding: 6px 8px; font-size: 12px; cursor: pointer;">
+                        <option value="verbose">Verbose</option>
+                        <option value="minimal">Minimal (Warnings + Errors)</option>
+                    </select>
+                    <button class="utility" onclick="window.setLogLevel(document.getElementById('logLevelSelect').value)" style="padding: 6px 12px; font-size: 11px;">Apply</button>
+                </div>
+            </div>
             <div class="micro-copy" style="margin-top: 10px; margin-bottom: 0;">
                 Reload the panel after updating bridge code so Premiere is not running stale JavaScript in memory. Once Start Bridge is on, connect from Codex, Claude, or another MCP client using the same temp directory. If commands fail, run diagnostics and share the generated JSON report from the temp directory.
             </div>

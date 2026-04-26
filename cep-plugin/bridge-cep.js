@@ -80,6 +80,10 @@
         this.wsClients = [];
         this.wsPort = 9876;
 
+        // Verbose logging toggle
+        this.logEnabled = true;
+        this.logLevel = 'verbose'; // 'verbose' or 'minimal'
+
         this.init();
     }
 
@@ -93,11 +97,24 @@
 
     MCPPremiereBridge.prototype.init = function() {
         this.log('Initializing MCP Bridge (CEP)...', 'info');
+        this.log('Platform: ' + os.platform() + ', Node version: ' + process.version, 'info');
 
         try {
             var env = this.normalizeHostEnvironment(this.csInterface.getHostEnvironment());
             if (env) {
-                this.log('Premiere Pro version: ' + env.appVersion + ' (build ' + env.appId + ')', 'info');
+                this.log('Host environment acquired', 'info');
+                this.log('  appName: ' + env.appName, 'info');
+                this.log('  appVersion: ' + env.appVersion, 'info');
+                this.log('  appLocale: ' + env.appLocale, 'info');
+                this.log('  appUILocale: ' + env.appUILocale, 'info');
+                this.log('  appId: ' + env.appId, 'info');
+                this.log('  isAppOnline: ' + env.isAppOnline, 'info');
+                if (env.appSkinInfo) {
+                    this.log('  skin baseFontFamily: ' + (env.appSkinInfo.baseFontFamily || 'n/a'), 'info');
+                    this.log('  skin baseFontSize: ' + (env.appSkinInfo.baseFontSize || 'n/a'), 'info');
+                }
+            } else {
+                this.log('Warning: No host environment returned', 'warning');
             }
         } catch (e) {
             this.log('Warning: Could not get host environment: ' + e.message, 'warning');
@@ -111,6 +128,26 @@
         } else {
             this.log('WebSocket module not found — file-only mode', 'warning');
         }
+
+        // Log extension ID
+        try {
+            var extId = this.csInterface.getExtensionID();
+            this.log('Extension ID: ' + extId, 'info');
+        } catch (e) {
+            this.log('Could not get extension ID: ' + e.message, 'warning');
+        }
+
+        // Log system path
+        try {
+            var extPath = this.csInterface.getSystemPath('extension');
+            this.log('Extension path: ' + extPath, 'info');
+        } catch (e) {}
+
+        // Log scale factor
+        try {
+            var scale = this.csInterface.getScaleFactor();
+            this.log('Scale factor: ' + scale, 'info');
+        } catch (e) {}
     };
 
     MCPPremiereBridge.prototype.getTempDirectory = function() {
@@ -200,38 +237,118 @@
     MCPPremiereBridge.prototype.executeCommand = function(command, done) {
         var self = this;
         this.updateCommandStatus(command.id, 'executing');
+
+        // Detailed logging before execution
+        this.log('[CMD] id: ' + command.id, 'info');
+        this.log('[CMD] type: ' + (command.type || 'script'), 'info');
+        if (command.filePath) {
+            this.log('[CMD] filePath: ' + command.filePath, 'info');
+        }
+        if (command.maxSize) {
+            this.log('[CMD] maxSize: ' + command.maxSize, 'info');
+        }
+        if (command.script) {
+            this.log('[CMD] script (' + command.script.length + ' chars): ' + command.script.substring(0, 80).replace(/\n/g, ' '), 'info');
+        }
+
+        // Handle file read commands directly via Node.js fs
+        if (command.type === 'readFile' && command.filePath) {
+            this.log('[CMD] Executing as file read', 'info');
+            try {
+                var filePath = command.filePath;
+                if (!fs.existsSync(filePath)) {
+                    this.log('[CMD] File not found: ' + filePath, 'error');
+                    done({ success: false, error: 'File not found: ' + filePath, timestamp: new Date().toISOString() });
+                    return;
+                }
+                var stats = fs.statSync(filePath);
+                this.log('[CMD] File size: ' + stats.size + ' bytes', 'info');
+                this.log('[CMD] File mtime: ' + stats.mtime.toISOString(), 'info');
+                var maxSize = command.maxSize || 10 * 1024 * 1024;
+                if (stats.size > maxSize) {
+                    this.log('[CMD] File too large: ' + stats.size + ' > ' + maxSize, 'error');
+                    done({ success: false, error: 'File too large: ' + stats.size + ' bytes (max: ' + maxSize + ')', timestamp: new Date().toISOString() });
+                    return;
+                }
+                var fileData = fs.readFileSync(filePath);
+                var base64Data = fileData.toString('base64');
+                var ext = path.extname(filePath).toLowerCase();
+                var mimeType = 'application/octet-stream';
+                if (ext === '.png') mimeType = 'image/png';
+                else if (ext === '.jpg' || ext === '.jpeg') mimeType = 'image/jpeg';
+                else if (ext === '.gif') mimeType = 'image/gif';
+                else if (ext === '.bmp') mimeType = 'image/bmp';
+                else if (ext === '.webp') mimeType = 'image/webp';
+                else if (ext === '.tiff' || ext === '.tif') mimeType = 'image/tiff';
+                this.log('[CMD] mimeType: ' + mimeType + ', data length: ' + base64Data.length, 'info');
+                done({
+                    success: true,
+                    result: {
+                        filePath: filePath,
+                        mimeType: mimeType,
+                        size: stats.size,
+                        data: 'data:' + mimeType + ';base64,' + base64Data
+                    },
+                    timestamp: new Date().toISOString()
+                });
+            } catch (e) {
+                this.log('[CMD] File read error: ' + e.message, 'error');
+                done({ success: false, error: 'Failed to read file: ' + e.message, timestamp: new Date().toISOString() });
+            }
+            return;
+        }
+
+        // Default: execute as ExtendScript
         if (!this.validateScript(command.script)) {
+            this.log('[CMD] Script validation failed', 'error');
             done({ success: false, error: 'Script validation failed' });
             return;
         }
         this.executeExtendScript(command.script, function(err, result) {
             if (err) {
+                self.log('[CMD] ExtendScript error: ' + err.message, 'error');
                 done({ success: false, error: err.message });
                 return;
             }
+            self.log('[CMD] Success, result type: ' + typeof result, 'info');
+            self.log('[CMD] result: ' + JSON.stringify(result).substring(0, 200), 'info');
             done({ success: true, result: result, timestamp: new Date().toISOString() });
         });
     };
 
     MCPPremiereBridge.prototype.executeExtendScript = function(script, callback) {
         var self = this;
+        var startTime = Date.now();
+
+        this.log('[ES] Script length: ' + script.length + ' chars', 'info');
+        this.log('[ES] Script preview: ' + script.substring(0, 100).replace(/\n/g, ' ').replace(/\r/g, ''), 'info');
+
         try {
             if (!this.csInterface) {
+                this.log('[ES] CSInterface not initialized', 'error');
                 callback(new Error('CSInterface not initialized'));
                 return;
             }
 
             var hostEnv = this.normalizeHostEnvironment(this.csInterface.getHostEnvironment());
             if (!hostEnv) {
+                this.log('[ES] Could not get host environment', 'error');
                 callback(new Error('Could not get host environment. Is Premiere Pro running?'));
                 return;
             }
+            this.log('[ES] Host environment OK, appId: ' + hostEnv.appId, 'info');
 
             var fullScript = EXTENDSCRIPT_COMPAT_HELPERS + '\n' + script;
+            this.log('[ES] Full script length (with helpers): ' + fullScript.length + ' chars', 'info');
+
             this.csInterface.evalScript(fullScript, function(result) {
-                self.log('EvalScript result: ' + result, 'info');
+                var elapsed = Date.now() - startTime;
+                self.log('[ES] evalScript completed in ' + elapsed + 'ms', 'info');
+                self.log('[ES] Raw result type: ' + typeof result + ', length: ' + (result ? result.length : 0), 'info');
+                self.log('[ES] Raw result preview: ' + String(result).substring(0, 150), 'info');
 
                 if (result === 'EvalScript error.' || result === 'EvalScript error') {
+                    self.log('[ES] ExtendScript execution failed via CEP evalScript()', 'error');
                     callback(new Error(
                         'ExtendScript execution failed via CEP evalScript(). ' +
                         'This is usually a host-side scripting failure or CEP compatibility issue, not a JSON parsing problem.'
@@ -240,18 +357,23 @@
                 }
 
                 if (typeof result === 'string' && result.indexOf('Error') === 0) {
+                    self.log('[ES] Script returned error string: ' + result, 'error');
                     callback(new Error(result));
                     return;
                 }
 
                 try {
                     var parsed = JSON.parse(result);
+                    self.log('[ES] JSON parsed successfully', 'info');
+                    self.log('[ES] Parsed result: ' + JSON.stringify(parsed).substring(0, 200), 'info');
                     callback(null, parsed);
                 } catch (e) {
+                    self.log('[ES] JSON parse failed, returning raw result: ' + e.message, 'warning');
                     callback(null, result);
                 }
             });
         } catch (e) {
+            this.log('[ES] Exception during execution: ' + e.message, 'error');
             callback(e);
         }
     };
@@ -316,19 +438,28 @@
             self.updateWebSocketStatus(true);
         });
 
-        this.wss.on('connection', function(ws) {
-            var clientAddr = ws._socket ? ws._socket.remoteAddress : 'unknown';
-            self.log('WebSocket client connected: ' + clientAddr, 'info');
+        this.wss.on('connection', function(ws, req) {
+            var clientAddr = ws._socket ? (ws._socket.remoteAddress + ':' + ws._socket.remotePort) : 'unknown';
+            var userAgent = req && req.headers && req.headers['user-agent'] ? req.headers['user-agent'] : 'n/a';
+            self.log('[WS] Client connected: ' + clientAddr, 'info');
+            self.log('[WS] User-Agent: ' + userAgent, 'info');
+            self.log('[WS] Active clients before adding: ' + self.wsClients.length, 'info');
             self.wsClients.push(ws);
+            self.log('[WS] Active clients after adding: ' + self.wsClients.length, 'info');
             self.updateWebSocketClientCount();
 
             ws.on('message', function(data) {
+                var msgSize = data.length || data.toString().length;
+                self.log('[WS] Message received, size: ' + msgSize + ' bytes', 'info');
                 try {
                     var command = JSON.parse(data.toString());
-                    self.log('WS command: ' + command.id, 'info');
+                    self.log('[WS] Parsed command id: ' + command.id + ', type: ' + (command.type || 'script'), 'info');
+                    self.log('[WS] Command keys: ' + Object.keys(command).join(', '), 'info');
                     self.addToQueue(command);
 
                     self.executeCommand(command, function(result) {
+                        var resultSize = JSON.stringify(result).length;
+                        self.log('[WS] Sending response for ' + command.id + ', result size: ' + resultSize + ' bytes', 'info');
                         try {
                             ws.send(JSON.stringify({
                                 id: command.id,
@@ -336,12 +467,14 @@
                                 timestamp: new Date().toISOString()
                             }));
                             self.updateCommandStatus(command.id, 'completed');
+                            self.log('[WS] Response sent successfully', 'info');
                         } catch (sendErr) {
-                            self.log('WS send error: ' + sendErr.message, 'error');
+                            self.log('[WS] Send error: ' + sendErr.message, 'error');
                         }
                     });
                 } catch (parseErr) {
-                    self.log('WS message parse error: ' + parseErr.message, 'error');
+                    self.log('[WS] Message parse error: ' + parseErr.message, 'error');
+                    self.log('[WS] Raw data preview: ' + data.toString().substring(0, 100), 'error');
                     try {
                         ws.send(JSON.stringify({ id: 'unknown', error: parseErr.message }));
                     } catch (e) {}
@@ -417,6 +550,8 @@
         var report = {
             generatedAt: new Date().toISOString(),
             panel: 'MCP Bridge (CEP)',
+            version: '2.0.0',
+            logSettings: this.getLogSettings(),
             tempDirectory: this.getTempDirectory(),
             transport: {
                 file: true,
@@ -428,31 +563,76 @@
                 }
             },
             hostEnvironment: null,
+            hostCapabilities: null,
+            systemPaths: {},
+            apiVersion: null,
             checks: []
         };
 
-        function addCheck(name, success, details) {
-            report.checks.push({ name: name, success: success, details: details });
+        function addCheck(name, success, details, rawResult) {
+            var check = { name: name, success: success, details: details };
+            if (rawResult !== undefined) check.rawResult = rawResult;
+            report.checks.push(check);
         }
 
         function finalize() {
             var reportPath = self.writeDiagnosticReport(report);
             if (reportPath) {
-                self.log('Diagnostics report saved to ' + reportPath, 'info');
+                self.log('[DIAG] Report saved: ' + reportPath, 'info');
             }
-            self.log('Diagnostics summary: ' + JSON.stringify(report), 'info');
+            self.log('[DIAG] === Diagnostic Summary ===', 'info');
+            self.log('[DIAG] Total checks: ' + report.checks.length, 'info');
+            self.log('[DIAG] Passed: ' + report.checks.filter(function(c) { return c.success; }).length, 'info');
+            self.log('[DIAG] Failed: ' + report.checks.filter(function(c) { return !c.success; }).length, 'info');
+            self.log('[DIAG] Full report: ' + JSON.stringify(report).substring(0, 400), 'info');
         }
 
-        this.log('Running CEP diagnostics...', 'info');
+        this.log('[DIAG] Running diagnostics...', 'info');
 
+        // Get host environment
         try {
             var hostEnvironment = this.normalizeHostEnvironment(this.csInterface.getHostEnvironment());
             report.hostEnvironment = hostEnvironment;
+            this.log('[DIAG] Host environment acquired: ' + (hostEnvironment ? hostEnvironment.appName + ' ' + hostEnvironment.appVersion : 'null'), 'info');
             addCheck('host_environment', !!hostEnvironment, hostEnvironment || 'No host environment returned');
         } catch (e) {
             addCheck('host_environment', false, e.message);
             finalize();
             return;
+        }
+
+        // Get host capabilities
+        try {
+            var caps = this.csInterface.getHostCapabilities();
+            report.hostCapabilities = caps;
+            this.log('[DIAG] Host capabilities: ' + JSON.stringify(caps), 'info');
+            addCheck('host_capabilities', !!caps, JSON.stringify(caps));
+        } catch (e) {
+            addCheck('host_capabilities', false, e.message);
+        }
+
+        // Get system paths
+        var pathTypes = ['userData', 'commonFiles', 'myDocuments', 'extension', 'hostApplication'];
+        var self2 = this;
+        pathTypes.forEach(function(pt) {
+            try {
+                var p = self2.csInterface.getSystemPath(pt);
+                report.systemPaths[pt] = p;
+            } catch (e) {
+                report.systemPaths[pt] = 'error: ' + e.message;
+            }
+        });
+        this.log('[DIAG] System paths: ' + JSON.stringify(report.systemPaths), 'info');
+        addCheck('system_paths', true, JSON.stringify(report.systemPaths));
+
+        // Get API version
+        try {
+            var apiVer = this.csInterface.getCurrentApiVersion();
+            report.apiVersion = apiVer;
+            this.log('[DIAG] API version: ' + JSON.stringify(apiVer), 'info');
+            addCheck('api_version', !!apiVer, JSON.stringify(apiVer));
+        } catch (e) {
+            addCheck('api_version', false, e.message);
         }
 
         var checks = [
@@ -485,11 +665,14 @@
             }
 
             var check = checks[index];
+            self.log('[DIAG] Running check: ' + check.name, 'info');
             self.executeExtendScript(check.script, function(err, result) {
                 if (err) {
+                    self.log('[DIAG] Check failed: ' + check.name + ' — ' + err.message, 'error');
                     addCheck(check.name, false, err.message);
                 } else {
-                    addCheck(check.name, true, result);
+                    self.log('[DIAG] Check passed: ' + check.name + ' → ' + JSON.stringify(result).substring(0, 100), 'info');
+                    addCheck(check.name, true, JSON.stringify(result), result);
                 }
                 runCheck(index + 1);
             });
@@ -667,16 +850,35 @@
     };
 
     MCPPremiereBridge.prototype.log = function(message, level) {
+        if (!this.logEnabled) return;
         level = level || 'info';
+
+        // In minimal mode, only log warnings and errors
+        if (this.logLevel === 'minimal' && level === 'info') return;
+
         var logContainer = document.getElementById('logContainer');
         if (logContainer) {
             var el = document.createElement('div');
             el.className = 'log-entry ' + level;
-            el.textContent = '[' + new Date().toISOString() + '] ' + message;
+            el.textContent = '[' + new Date().toISOString() + '] [' + level.toUpperCase() + '] ' + message;
             logContainer.appendChild(el);
             logContainer.scrollTop = logContainer.scrollHeight;
         }
-        console.log(message);
+        console.log('[' + level.toUpperCase() + '] ' + message);
+    };
+
+    MCPPremiereBridge.prototype.setLogEnabled = function(enabled) {
+        this.logEnabled = enabled !== false;
+        this.log('Logging ' + (this.logEnabled ? 'enabled' : 'disabled'), 'info');
+    };
+
+    MCPPremiereBridge.prototype.setLogLevel = function(level) {
+        this.logLevel = (level === 'verbose' || level === 'minimal') ? level : 'verbose';
+        this.log('Log level set to: ' + this.logLevel, 'info');
+    };
+
+    MCPPremiereBridge.prototype.getLogSettings = function() {
+        return { enabled: this.logEnabled, level: this.logLevel };
     };
 
     MCPPremiereBridge.prototype.clearLog = function() {
@@ -691,6 +893,9 @@
     window.runDiagnostics = function() { if (window.bridge) window.bridge.runDiagnostics(); };
     window.saveConfig = function() { if (window.bridge) window.bridge.saveConfig(); };
     window.clearLog = function() { if (window.bridge) window.bridge.clearLog(); };
+    window.setLogEnabled = function(enabled) { if (window.bridge) window.bridge.setLogEnabled(enabled); };
+    window.setLogLevel = function(level) { if (window.bridge) window.bridge.setLogLevel(level); };
+    window.getLogSettings = function() { if (window.bridge) return window.bridge.getLogSettings(); return { enabled: true, level: 'verbose' }; };
     document.addEventListener('DOMContentLoaded', function() {
         window.bridge = new MCPPremiereBridge();
     });
